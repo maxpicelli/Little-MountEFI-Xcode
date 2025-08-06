@@ -13,6 +13,7 @@ struct EFIPartition: Identifiable, Hashable {
     let isInternal: Bool
     let isReadOnly: Bool
     let mountPoint: String
+    let parentDisk: String
     
     var statusIcon: String {
         if isMounted {
@@ -37,24 +38,31 @@ struct EFIPartition: Identifiable, Hashable {
     var displayName: String {
         return diskLabel.isEmpty ? diskName : diskLabel
     }
+    
+    var canEject: Bool {
+        return !isInternal && isMounted
+    }
 }
 
 // MARK: - Background Manager
 class BackgroundManager: ObservableObject {
     @Published var backgroundImage: NSImage?
-    @Published var backgroundOpacity: Double = 0.9
+    private let fixedOpacity: Double = 0.9
     @Published var useGradientOverlay: Bool = false
+    
+    var backgroundOpacity: Double {
+        return fixedOpacity
+    }
     
     init() {
         loadBackgroundImage()
     }
     
     private func loadBackgroundImage() {
-        // Ordem de prioridade para carregar imagens
         let imageNames = ["mount_efi_bg", "background", "wallpaper"]
         let extensions = ["png", "jpg", "jpeg", "heic"]
         
-        // 1. Tentar do bundle primeiro
+        // 1. Bundle
         for imageName in imageNames {
             if let bundleImage = NSImage(named: imageName) {
                 self.backgroundImage = bundleImage
@@ -62,7 +70,7 @@ class BackgroundManager: ObservableObject {
             }
         }
         
-        // 2. Tentar do diretório Documents
+        // 2. Documents
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         if let documentsPath = documentsPath {
             for imageName in imageNames {
@@ -76,7 +84,7 @@ class BackgroundManager: ObservableObject {
             }
         }
         
-        // 3. Tentar do diretório Desktop (mais fácil para usuário)
+        // 3. Desktop
         let desktopPath = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
         if let desktopPath = desktopPath {
             for imageName in imageNames {
@@ -98,7 +106,7 @@ class BackgroundManager: ObservableObject {
     }
 }
 
-// MARK: - Background View Component
+// MARK: - Background View
 struct BackgroundView: View {
     let image: NSImage?
     let opacity: Double
@@ -106,16 +114,14 @@ struct BackgroundView: View {
     
     var body: some View {
         ZStack {
-            // Imagem de fundo
             if let image = image {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .ignoresSafeArea(.all) // Para ocupar 100% incluindo safe areas
+                    .clipped()
                     .opacity(opacity)
                     .animation(.easeInOut(duration: 0.5), value: opacity)
             } else {
-                // Fallback: gradiente padrão se não há imagem
                 LinearGradient(
                     gradient: Gradient(colors: [
                         Color(red: 0.1, green: 0.15, blue: 0.25),
@@ -126,7 +132,6 @@ struct BackgroundView: View {
                 )
             }
             
-            // Gradiente sobreposto para legibilidade
             if useGradient {
                 LinearGradient(
                     gradient: Gradient(colors: [
@@ -148,6 +153,7 @@ class EFIManager: ObservableObject {
     @Published var isScanning = false
     @Published var errorMessage: String?
     @Published var showingAlert = false
+    @Published var lastOperationTime: Date?
     
     func scanEFIPartitions() {
         isScanning = true
@@ -172,10 +178,7 @@ class EFIManager: ObservableObject {
     }
     
     private func detectEFIPartitions() throws -> [EFIPartition] {
-        // Detectar EFI de boot
         let bootEFI = detectBootEFI()
-        
-        // Obter todas as partições EFI
         let efiDisksOutput = try executeShellCommand("diskutil list | grep EFI | awk '{print $NF}'")
         let efiDisks = efiDisksOutput.components(separatedBy: .newlines).filter { !$0.isEmpty }
         
@@ -192,13 +195,11 @@ class EFIManager: ObservableObject {
     
     private func detectBootEFI() -> String {
         do {
-            // Método 1: NVRAM
             let bootEFIUUID = try executeShellCommand("nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path | sed 's/.*GPT,\\([^,]*\\),.*/\\1/'")
             let bootEFI = try executeShellCommand("diskutil info '\(bootEFIUUID)' | awk -F': ' '/Device Identifier/ {print $2}' | xargs")
             return bootEFI
         } catch {
             do {
-                // Método 2: Disco do sistema
                 let systemDisk = try executeShellCommand("diskutil info / | awk -F': ' '/Device Identifier/ {print $2}' | xargs")
                 let wholeDisk = try executeShellCommand("diskutil info '\(systemDisk)' | awk -F': ' '/Part of Whole/ {print $2}' | xargs")
                 return "\(wholeDisk)s1"
@@ -251,53 +252,93 @@ class EFIManager: ObservableObject {
             hasBootloader: hasBootloader,
             isInternal: isInternal,
             isReadOnly: isReadOnly,
-            mountPoint: mountPoint
+            mountPoint: mountPoint,
+            parentDisk: parentDisk
         )
     }
     
+    // DUPLO CLIQUE - Monta/Desmonta DIRETO!
     func toggleMount(partition: EFIPartition) {
         let command = partition.isMounted ? "diskutil unmount" : "diskutil mount"
         let fullCommand = "\(command) '\(partition.diskName)'"
         
         DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            do shell script "\(fullCommand)" with administrator privileges
+            """
+            
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
             do {
-                // Usar osascript para executar com privilégios administrativos
-                let script = """
-                do shell script "\(fullCommand)" with administrator privileges
-                """
-                
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", script]
-                
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
-                
                 try process.run()
                 process.waitUntilExit()
                 
                 DispatchQueue.main.async {
                     if process.terminationStatus == 0 {
-                        // Sucesso - atualizar lista após delay
+                        self.lastOperationTime = Date()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                             self.scanEFIPartitions()
                             
-                            // Se montou com sucesso, abrir no Finder e trazer janela para frente
                             if !partition.isMounted {
                                 self.openInFinder(diskName: partition.diskName)
                                 self.bringWindowToFront()
                             }
                         }
                     } else {
-                        // Erro - ler mensagem do pipe
                         let data = pipe.fileHandleForReading.readDataToEndOfFile()
                         let errorOutput = String(data: data, encoding: .utf8) ?? "Erro desconhecido"
                         self.errorMessage = errorOutput
                         self.showingAlert = true
                     }
                 }
+            } catch {
+                DispatchQueue.main.async {
+                    self.errorMessage = error.localizedDescription
+                    self.showingAlert = true
+                }
+            }
+        }
+    }
+    
+    func ejectDisk(partition: EFIPartition) {
+        let fullCommand = "diskutil eject '\(partition.parentDisk)'"
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            let script = """
+            do shell script "\(fullCommand)" with administrator privileges
+            """
+            
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", script]
+            
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
+            do {
+                try process.run()
+                process.waitUntilExit()
                 
+                DispatchQueue.main.async {
+                    if process.terminationStatus == 0 {
+                        self.lastOperationTime = Date()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            self.scanEFIPartitions()
+                        }
+                    } else {
+                        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                        let errorOutput = String(data: data, encoding: .utf8) ?? "Erro ao ejetar dispositivo"
+                        self.errorMessage = errorOutput
+                        self.showingAlert = true
+                    }
+                }
             } catch {
                 DispatchQueue.main.async {
                     self.errorMessage = error.localizedDescription
@@ -319,7 +360,6 @@ class EFIManager: ObservableObject {
         }
     }
     
-    // Trazer janela para frente
     private func bringWindowToFront() {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
@@ -330,13 +370,11 @@ class EFIManager: ObservableObject {
         }
     }
     
-    // Forçar scan completo
     func forceRescan() {
         isScanning = true
         errorMessage = nil
         
         DispatchQueue.global(qos: .userInitiated).async {
-            // Aguardar um pouco para garantir que mudanças sejam detectadas
             Thread.sleep(forTimeInterval: 1.0)
             
             do {
@@ -379,13 +417,14 @@ class EFIManager: ObservableObject {
     }
 }
 
-// MARK: - Views
+// MARK: - Main Content View
 struct ContentView: View {
     @StateObject private var efiManager = EFIManager()
     @StateObject private var backgroundManager = BackgroundManager()
     @State private var selectedPartition: EFIPartition?
     @State private var showingInfo = false
     @State private var showingSettings = false
+    @State private var showingCompactWindow = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -425,6 +464,10 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView(backgroundManager: backgroundManager)
         }
+        // JANELA COMPACTA FLUTUANTE
+        .sheet(isPresented: $showingCompactWindow) {
+            CompactMountView(efiManager: efiManager)
+        }
         .frame(minWidth: 750, minHeight: 650)
         .background(
             BackgroundView(
@@ -450,7 +493,19 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Botão de informações
+                // BOTÃO JANELA COMPACTA
+                Button(action: { showingCompactWindow = true }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "rectangle.compress.vertical")
+                            .font(.callout)
+                        Text("Compacta")
+                            .font(.caption)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .help("Abrir janela compacta flutuante")
+                
                 Button(action: { showingInfo = true }) {
                     Image(systemName: "info.circle")
                         .font(.title2)
@@ -478,6 +533,7 @@ struct ContentView: View {
             HStack(spacing: 20) {
                 legendItem("🔹", "EFI Boot")
                 legendItem("◈", "Bootloader")
+                legendItem("🖱️🖱️", "Duplo clique monta/desmonta")
                 Spacer()
             }
             
@@ -485,6 +541,7 @@ struct ContentView: View {
                 legendItem("✅", "Montada")
                 legendItem("🔘", "Interna")
                 legendItem("🟡", "USB/Ext")
+                legendItem("⌘+🖱️🖱️", "Cmd+Duplo clique ejeta")
                 Spacer()
             }
         }
@@ -549,7 +606,15 @@ struct ContentView: View {
                         partition: partition,
                         isSelected: selectedPartition == partition,
                         onSelect: { selectedPartition = partition },
-                        onToggleMount: { efiManager.toggleMount(partition: partition) }
+                        onToggleMount: { efiManager.toggleMount(partition: partition) },
+                        onEject: { efiManager.ejectDisk(partition: partition) },
+                        // DUPLO CLIQUE = AÇÃO DIRETA!
+                        onDoubleClick: { efiManager.toggleMount(partition: partition) },
+                        onCmdDoubleClick: {
+                            if partition.canEject {
+                                efiManager.ejectDisk(partition: partition)
+                            }
+                        }
                     )
                 }
             }
@@ -560,7 +625,6 @@ struct ContentView: View {
     
     private var footerView: some View {
         HStack {
-            // Botão de configurações
             Button(action: { showingSettings = true }) {
                 Image(systemName: "gearshape")
             }
@@ -574,7 +638,6 @@ struct ContentView: View {
             .disabled(efiManager.isScanning)
             .tint(.orange)
             
-            // Botão de scan forçado
             Button("Scan Completo") {
                 efiManager.forceRescan()
             }
@@ -585,12 +648,26 @@ struct ContentView: View {
             Spacer()
             
             if let selected = selectedPartition {
-                Button(selected.isMounted ? "Desmontar" : "Montar") {
-                    efiManager.toggleMount(partition: selected)
+                HStack(spacing: 8) {
+                    if selected.canEject {
+                        Button(action: { efiManager.ejectDisk(partition: selected) }) {
+                            HStack {
+                                Image(systemName: "eject")
+                                Text("Ejetar")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(efiManager.isScanning)
+                        .tint(.red)
+                    }
+                    
+                    Button(selected.isMounted ? "Desmontar" : "Montar") {
+                        efiManager.toggleMount(partition: selected)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(efiManager.isScanning)
+                    .tint(.orange)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(efiManager.isScanning)
-                .tint(.orange)
             }
             
             Button("Sair") {
@@ -605,15 +682,20 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Partition Row View COM DUPLO CLIQUE
 struct PartitionRowView: View {
     let partition: EFIPartition
     let isSelected: Bool
     let onSelect: () -> Void
     let onToggleMount: () -> Void
+    let onEject: () -> Void
+    let onDoubleClick: () -> Void
+    let onCmdDoubleClick: () -> Void
+    
+    @State private var isHovering = false
     
     var body: some View {
         HStack(spacing: 12) {
-            // Status and Boot markers
             HStack(spacing: 4) {
                 Text(partition.statusIcon)
                     .font(.title2)
@@ -677,32 +759,223 @@ struct PartitionRowView: View {
                     .foregroundColor(.gray)
             }
             
-            Button(partition.isMounted ? "Desmontar" : "Montar") {
-                onToggleMount()
+            HStack(spacing: 8) {
+                if partition.canEject {
+                    Button(action: onEject) {
+                        Image(systemName: "eject")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
+                    .tint(.red)
+                    .help("Ejetar dispositivo")
+                }
+                
+                Button(partition.isMounted ? "Desmontar" : "Montar") {
+                    onToggleMount()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .tint(.orange)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .tint(.orange)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(isSelected ? Color.orange.opacity(0.2) : Color.black.opacity(0.4))
+                .fill(isSelected ? Color.orange.opacity(0.2) : (isHovering ? Color.white.opacity(0.1) : Color.black.opacity(0.4)))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
-                        .stroke(isSelected ? Color.orange : Color.gray.opacity(0.3), lineWidth: 2)
+                        .stroke(isSelected ? Color.orange : (isHovering ? Color.orange.opacity(0.5) : Color.gray.opacity(0.3)), lineWidth: 2)
                 )
         )
         .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovering = hovering
+        }
+        // DUPLO CLIQUE MÁGICO! 🎯
+        .onTapGesture(count: 2) {
+            if NSEvent.modifierFlags.contains(.command) {
+                onCmdDoubleClick()
+            } else {
+                onDoubleClick() // <- AQUI É A MÁGICA!
+            }
+        }
         .onTapGesture {
             onSelect()
         }
         .animation(.easeInOut(duration: 0.2), value: isSelected)
+        .animation(.easeInOut(duration: 0.1), value: isHovering)
     }
 }
 
-// VIEW: Informações do App
+// MARK: - JANELA COMPACTA FLUTUANTE! 🚀
+struct CompactMountView: View {
+    @ObservedObject var efiManager: EFIManager
+    @Environment(\.dismiss) private var dismiss
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header super compacto
+            HStack {
+                Image(systemName: "externaldrive.fill")
+                    .foregroundColor(.orange)
+                    .font(.title2)
+                
+                Text("Quick Mount")
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .fontWeight(.bold)
+                
+                Spacer()
+                
+                Button("✕") {
+                    dismiss()
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.gray)
+                .font(.title2)
+            }
+            .padding(12)
+            .background(Color(red: 0.2, green: 0.3, blue: 0.5).opacity(0.8))
+            
+            // Instrução clara
+            HStack {
+                Image(systemName: "hand.tap")
+                    .foregroundColor(.orange)
+                    .font(.caption)
+                Text("Duplo clique para montar/desmontar")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+            }
+            .padding(.vertical, 6)
+            
+            // Lista ultra compacta
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(efiManager.partitions) { partition in
+                        CompactPartitionRow(
+                            partition: partition,
+                            onDoubleClick: { efiManager.toggleMount(partition: partition) }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            
+            // Footer compacto
+            HStack(spacing: 8) {
+                Button("Atualizar") {
+                    efiManager.scanEFIPartitions()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.orange)
+                .disabled(efiManager.isScanning)
+                
+                if efiManager.isScanning {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                        .tint(.orange)
+                }
+            }
+            .padding(8)
+            .background(Color.black.opacity(0.3))
+        }
+        .frame(width: 380, height: 420)
+        .background(Color.black.opacity(0.95))
+        .cornerRadius(12)
+        .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 10)
+    }
+}
+
+// MARK: - Linha Compacta da Janela Flutuante
+struct CompactPartitionRow: View {
+    let partition: EFIPartition
+    let onDoubleClick: () -> Void
+    @State private var isHovering = false
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            // Status + Boot
+            HStack(spacing: 2) {
+                Text(partition.statusIcon)
+                    .font(.callout)
+                Text(partition.bootMarker)
+                    .font(.callout)
+                    .frame(width: 12)
+            }
+            
+            // Nome do disco
+            Text(partition.diskName)
+                .font(.system(.body, design: .monospaced))
+                .foregroundColor(.white)
+                .fontWeight(.medium)
+            
+            Spacer()
+            
+            // Badges compactos
+            HStack(spacing: 4) {
+                if partition.isBootEFI {
+                    Text("BOOT")
+                        .font(.caption2)
+                        .fontWeight(.bold)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.3))
+                        .foregroundColor(.orange)
+                        .cornerRadius(4)
+                }
+                
+                if partition.hasBootloader {
+                    Text("BL")
+                        .font(.caption2)
+                        .fontWeight(.bold)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.3))
+                        .foregroundColor(.blue)
+                        .cornerRadius(4)
+                }
+                
+                if partition.isReadOnly {
+                    Image(systemName: "lock.fill")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+            }
+            
+            // Tipo
+            Text(partition.isInternal ? "INT" : "EXT")
+                .font(.caption2)
+                .foregroundColor(.gray)
+                .frame(width: 24)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isHovering ? Color.orange.opacity(0.2) : Color.white.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(isHovering ? Color.orange.opacity(0.6) : Color.clear, lineWidth: 1)
+                )
+        )
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+        }
+        // DUPLO CLIQUE DIRETO!
+        .onTapGesture(count: 2) {
+            onDoubleClick()
+        }
+        .help("Duplo clique para \(partition.isMounted ? "desmontar" : "montar")")
+    }
+}
+
+// MARK: - Views Auxiliares
 struct InfoView: View {
     @Environment(\.dismiss) private var dismiss
     
@@ -716,16 +989,20 @@ struct InfoView: View {
                 .font(.largeTitle)
                 .fontWeight(.bold)
             
-            Text("Versão 2.0")
+            Text("Versão 2.1 - macOS Ventura+")
                 .font(.title2)
                 .foregroundColor(.secondary)
             
             VStack(alignment: .leading, spacing: 8) {
+                Text("✨ **NOVO**: Duplo clique para montar/desmontar")
+                Text("✨ **NOVO**: Janela compacta flutuante")
                 Text("• Monta e desmonta partições EFI")
+                Text("• Ejeta dispositivos externos com segurança")
                 Text("• Detecta EFI de boot automaticamente")
                 Text("• Identifica bootloaders (OpenCore/Clover)")
                 Text("• Interface moderna e intuitiva")
-                Text("• Papel de parede personalizável")
+                Text("• Papel de parede customizável")
+                Text("• Compatível com macOS Ventura 13.7.7+")
             }
             .font(.body)
             
@@ -738,11 +1015,10 @@ struct InfoView: View {
             .tint(.orange)
         }
         .padding(30)
-        .frame(width: 400, height: 500)
+        .frame(width: 480, height: 580)
     }
 }
 
-// VIEW: Configurações
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var backgroundManager: BackgroundManager
@@ -758,7 +1034,6 @@ struct SettingsView: View {
                 .fontWeight(.bold)
             
             VStack(alignment: .leading, spacing: 16) {
-                // Configurações existentes
                 Toggle("Scan automático na inicialização", isOn: $autoScanEnabled)
                 Toggle("Mostrar notificações", isOn: $showNotifications)
                 Toggle("Abrir Finder após montar", isOn: $openFinderAfterMount)
@@ -771,9 +1046,8 @@ struct SettingsView: View {
                         .font(.headline)
                     
                     HStack {
-                        Text("Opacidade:")
-                        Slider(value: $backgroundManager.backgroundOpacity, in: 0.1...1.0, step: 0.1)
-                        Text("\(Int(backgroundManager.backgroundOpacity * 100))%")
+                        Text("Opacidade: 90% (fixo)")
+                            .foregroundColor(.secondary)
                     }
                     
                     Toggle("Usar gradiente sobreposto", isOn: $backgroundManager.useGradientOverlay)
@@ -806,7 +1080,7 @@ struct SettingsView: View {
             }
         }
         .padding(30)
-        .frame(width: 450, height: 400)
+        .frame(width: 450, height: 420)
         .fileImporter(
             isPresented: $showingFilePicker,
             allowedContentTypes: [.image],
@@ -840,27 +1114,43 @@ struct LittleMountEFIApp: App {
     }
 }
 
-// MARK: - Extensions
-extension NSColor {
-    static let controlBackgroundColor = NSColor.controlBackgroundColor
-}
-
 /*
- COMO ADICIONAR UMA IMAGEM DE FUNDO:
+ 🚀 LITTLE MOUNTEFI - VERSÃO COMPLETA COM DUPLO CLIQUE
  
- 1. Adicione no Xcode:
-    - Arraste a imagem para Assets.xcassets
-    - Nomeie como "mount_efi_bg"
+ ✨ NOVIDADES IMPLEMENTADAS:
  
- 2. Ou coloque em um dos diretórios:
-    - ~/Documents/mount_efi_bg.png
-    - ~/Desktop/mount_efi_bg.png
-    
- 3. Formatos suportados: PNG, JPG, JPEG, HEIC
+ 1. **DUPLO CLIQUE DIRETO** 🖱️🖱️
+    - Duplo clique na linha = monta/desmonta INSTANTÂNEO
+    - Cmd+Duplo clique = ejeta (se externo)
+    - Pede senha e executa - simples assim!
  
- 4. A imagem será automaticamente redimensionada para ocupar 100% da janela
+ 2. **JANELA COMPACTA FLUTUANTE** 📱
+    - Botão "Compacta" no header
+    - Janela pequena (380x420px)
+    - Lista ultra compacta
+    - Duplo clique funciona igual
+    - Perfeita para uso rápido
  
- 5. Use as configurações para ajustar opacidade e gradiente
+ 3. **MELHORIAS VISUAIS** ✨
+    - Hover effects suaves
+    - Badges compactos na janela pequena
+    - Instruções claras
+    - Animações fluidas
  
- 6. No app, vá em Configurações > Papel de Parede para personalizar
+ ⚡ FLUXO DE USO SUPER RÁPIDO:
+ 1. Abrir app
+ 2. Duplo clique na partição
+ 3. Inserir senha
+ 4. ✅ MONTADO! (abre no Finder)
+ 
+ 🎯 EXATAMENTE COMO VOCÊ PEDIU:
+ ✅ Duplo clique = ação imediata
+ ✅ Janela compacta flutuante
+ ✅ Mais rápido, menos cliques
+ ✅ Pede senha e executa
+ 
+ COMPATIBILIDADE:
+ - macOS Ventura 13.7.7+
+ - Xcode 14.0+
+ - Swift 5.7+
  */
